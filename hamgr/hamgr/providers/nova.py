@@ -42,7 +42,7 @@ class NovaProvider(Provider):
         periodic_task.add_task(self._check_host_aggregate_changes, 120,
                                run_now=True)
 
-    def _check_host_aggregate_changes(self):
+    def _check_host_aggregate_changes(self, skip_disabled_hosts=False):
         self._token = utils.get_token(self._tenant, self._username, self._passwd, self._token)
         clusters = db_api.get_all_active_clusters()
         client = self._get_client()
@@ -50,6 +50,9 @@ class NovaProvider(Provider):
             aggregate_id = cluster.name
             aggregate = self._get_aggregate(client, aggregate_id)
             current_host_ids = set(aggregate.hosts)
+            if skip_disabled_hosts:
+                current_host_ids = set([host for host in current_host_ids
+                    if self._get_nova_service_status(host) == 'enabled'])
 
             try:
                 nodes = masakari.get_nodes_in_segment(self._token, aggregate_id)
@@ -58,8 +61,9 @@ class NovaProvider(Provider):
                 if db_node_ids == current_host_ids:
                     continue
 
-                self._disable(aggregate_id, synchronize=True)
-                self._enable(aggregate_id)
+                self._disable(aggregate_id, synchronize=True,
+                              hosts=list(current_host_ids))
+                self._enable(aggregate_id, hosts=list(current_host_ids))
             except ha_exceptions.ClusterBusy:
                 pass
             except ha_exceptions.SegmentNotFound:
@@ -67,6 +71,15 @@ class NovaProvider(Provider):
             except Exception as e:
                 LOG.error('Exception while processing aggregate %s: %s', aggregate_id, e)
 
+    def _get_nova_service_status(self, host_id):
+        client = self._get_client()
+        services= client.services.list(binary='nova-compute', host=host_id)
+        if len(services) == 1:
+            return services[0].status
+        else:
+            LOG.error('Found %d nova compute services with %s host id'
+                    % (len(services), host_id))
+            raise ha_exceptions.HostNotFound(host_id)
 
     def _get_client(self):
         return client.Client(2,
@@ -174,7 +187,7 @@ class NovaProvider(Provider):
                    'server', ip=leader_ip)
         self._auth(ip_lookup, self._token, agents, 'agent', ip=leader_ip)
 
-    def _enable(self, aggregate_id):
+    def _enable(self, aggregate_id, hosts=None):
         client = self._get_client()
         str_aggregate_id = str(aggregate_id)
         cluster = None
@@ -194,9 +207,15 @@ class NovaProvider(Provider):
 
         self._token = utils.get_token(self._tenant, self._username, self._passwd, self._token)
 
+        if not hosts:
+            hosts = aggregate.hosts
+        else:
+            LOG.info('Enabling HA on some of the hosts %s of the %s aggregate',
+                     str(hosts), aggregate_id)
+
         try:
             # 1. Push roles
-            self._assign_roles(client, aggregate.hosts)
+            self._assign_roles(client, hosts)
 
             # 2. Create cluster
             cluster = db_api.create_cluster_if_needed(str_aggregate_id, states.TASK_CREATING)
@@ -204,7 +223,7 @@ class NovaProvider(Provider):
             LOG.info('Creating cluster with id %d', cluster_id)
 
             # 3. Create fail-over segment
-            masakari.create_failover_segment(self._token, str_aggregate_id, aggregate.hosts)
+            masakari.create_failover_segment(self._token, str_aggregate_id, hosts)
 
             LOG.info('Enabling cluster %d', cluster_id)
             db_api.update_cluster(cluster_id, True)
@@ -281,11 +300,9 @@ class NovaProvider(Provider):
 
         try:
             self._token = utils.get_token(self._tenant, self._username, self._passwd, self._token)
+            nodes = masakari.get_nodes_in_segment(self._token, cluster.name)
+            hosts = [n['host'] for n in nodes]
             masakari.delete_failover_segment(self._token, str_aggregate_id)
-
-            client = self._get_client()
-            aggregate = self._get_aggregate(client, aggregate_id)
-            hosts = set(aggregate.hosts)
             if hosts:
                 self._deauth(hosts)
                 if synchronize:
@@ -298,7 +315,6 @@ class NovaProvider(Provider):
             if cluster:
                 db_api.update_cluster(cluster.id, False)
                 db_api.update_cluster_task_state(cluster.id, states.TASK_COMPLETED)
-
 
     def put(self, aggregate_id, method):
         if method == 'enable':
