@@ -41,8 +41,9 @@ class NovaProvider(Provider):
         self._token = None
         periodic_task.add_task(self._check_host_aggregate_changes, 120,
                                run_now=True)
+        self.hosts_down_per_cluster = {}
 
-    def _check_host_aggregate_changes(self, skip_disabled_hosts=False):
+    def _check_host_aggregate_changes(self):
         self._token = utils.get_token(self._tenant, self._username, self._passwd, self._token)
         clusters = db_api.get_all_active_clusters()
         client = self._get_client()
@@ -50,20 +51,46 @@ class NovaProvider(Provider):
             aggregate_id = cluster.name
             aggregate = self._get_aggregate(client, aggregate_id)
             current_host_ids = set(aggregate.hosts)
-            if skip_disabled_hosts:
-                current_host_ids = set([host for host in current_host_ids
-                    if self._get_nova_service_status(host) == 'enabled'])
-
+            new_host_ids = set()
+            active_host_ids = set()
+            inactive_host_ids = set()
             try:
                 nodes = masakari.get_nodes_in_segment(self._token, aggregate_id)
                 db_node_ids = set([node['name'] for node in nodes])
+                for host in current_host_ids:
+                    if self._is_nova_service_active(host, client=client):
+                        if host not in db_node_ids:
+                            new_host_ids.add(host)
+                        else:
+                            active_host_ids.add(host)
+                    else:
+                        if host in db_node_ids:
+                            # Only the host currently part of cluster that are
+                            # down are of interest
+                            inactive_host_ids.add(host)
+                        else:
+                            LOG.info('Ignoring down host %s as it is not part'
+                                     ' of the cluster', host)
 
-                if db_node_ids == current_host_ids:
+                LOG.info('Found %s active hosts', str(active_host_ids))
+                LOG.info('Found %s new hosts', str(new_host_ids))
+                LOG.info('Found %s inactive hosts', str(inactive_host_ids))
+
+                if len(new_host_ids) == 0:
+                    # No new hosts to process
                     continue
 
-                self._disable(aggregate_id, synchronize=True,
-                              hosts=list(current_host_ids))
-                self._enable(aggregate_id, hosts=list(current_host_ids))
+                if inactive_host_ids or \
+                        cluster.state in [states.TASK_MIGRATING,
+                                          states.TASK_UPDATING]:
+                    # Host aggregate has changed but there are inactive hosts
+                    # in the host aggregate or another thread is working on
+                    # same cluster so do not reconfigure the cluster yet
+                    continue
+
+                self._disable(aggregate_id, synchronize=True)
+                self._enable(aggregate_id,
+                             hosts=list(active_host_ids.union(new_host_ids)))
             except ha_exceptions.ClusterBusy:
                 pass
             except ha_exceptions.SegmentNotFound:
@@ -71,11 +98,12 @@ class NovaProvider(Provider):
             except Exception as e:
                 LOG.error('Exception while processing aggregate %s: %s', aggregate_id, e)
 
-    def _get_nova_service_status(self, host_id):
-        client = self._get_client()
+    def _is_nova_service_active(self, host_id, client=None):
+        if not client:
+            client = self._get_client()
         services= client.services.list(binary='nova-compute', host=host_id)
         if len(services) == 1:
-            return services[0].status
+            return services[0].state == 'up'
         else:
             LOG.error('Found %d nova compute services with %s host id'
                     % (len(services), host_id))
@@ -322,6 +350,53 @@ class NovaProvider(Provider):
         else:
             self._disable(aggregate_id)
 
+    def _get_cluster_for_host(self, host_id, client=None):
+        if not client:
+            client = self._get_client()
+        clusters = db_api.get_all_active_clusters()
+        for cluster in clusters:
+            aggregate_id = cluster.name
+            aggregate = self._get_aggregate(client, aggregate_id)
+            if host_id in aggregate.hosts:
+                return cluster
+        raise ha_exceptions.HostNotFound(host=host_id)
+
+    def _remove_host_from_cluster(self, cluster, host, client=None):
+        if cluster.task_state != states.TASK_MIGRATING:
+            raise ha_exceptions.ClusterBusy(cluster.id, cluster.task_state)
+
+        if not client:
+            client = self._get_client()
+        aggregate_id = cluster.name
+        aggregate = self._get_aggregate(client, aggregate_id)
+        current_host_ids = set(aggregate.hosts)
+        if cluster.id not in self.hosts_down_per_cluster:
+            self.hosts_down_per_cluster[cluster.id] = {}
+        try:
+            nodes = masakari.get_nodes_in_segment(self._token, aggregate_id)
+            db_node_ids = set([node['name'] for node in nodes])
+            for current_host in current_host_ids:
+                if not self._is_nova_service_active(current_host, client=client):
+                    if current_host in db_node_ids and \
+                            current_host not in self.hosts_down_per_cluster[cluster.id]:
+                        self.hosts_down_per_cluster[cluster.id][current_host] = False
+                else:
+                    current_host in self.hosts_down_per_cluster[cluster.id]:
+                        self.hosts_down_per_cluster.pop(current_host)
+
+            self.hosts_down_per_cluster[cluster.id][host] = True
+            if all([v for k, v in self.hosts_down_per_cluster[cluster.id].items()]):
+                host_list = current_host_ids - \
+                        set(self.hosts_down_per_cluster[cluster.id].keys())
+                self._disable(aggregate_id, synchronize=True)
+                self._enable(aggregate_id, hosts=list(host_list))
+                self.hosts_down_per_cluster.pop(cluster.id)
+            else:
+                LOG.info('There are still down hosts that need to be reported'
+                         ' before reconfiguring the cluster')
+        finally:
+            db_api.update_cluster_task_state(cluster.id, states.TASK_COMPLETED)
+
     def host_down(self, event_details):
         host = event_details['hostname']
         time = event_details['time']
@@ -334,10 +409,17 @@ class NovaProvider(Provider):
             "host_status": host_status,
             "cluster_status": cluster_status
         }
+
         try:
+            cluster = self._get_cluster_for_host(host)
+            db_api.update_cluster_task_state(cluster.id, states.TASK_MIGRATING)
             self._token = utils.get_token(self._tenant, self._username, self._passwd, self._token)
             masakari.create_notification(self._token, notification_type,
                                          host, time, payload)
+            def _remove_host_task():
+                self._remove_host_from_cluster(cluster, host)
+
+            periodic_task.add_task(_remove_host_task, 0, run_now=True, run_once=True)
         except:
             return False
         return True
