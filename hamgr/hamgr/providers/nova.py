@@ -381,7 +381,7 @@ class NovaProvider(Provider):
                             current_host not in self.hosts_down_per_cluster[cluster.id]:
                         self.hosts_down_per_cluster[cluster.id][current_host] = False
                 else:
-                    current_host in self.hosts_down_per_cluster[cluster.id]:
+                    if current_host in self.hosts_down_per_cluster[cluster.id]:
                         self.hosts_down_per_cluster.pop(current_host)
 
             self.hosts_down_per_cluster[cluster.id][host] = True
