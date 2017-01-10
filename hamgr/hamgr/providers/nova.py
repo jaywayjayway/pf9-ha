@@ -84,8 +84,7 @@ class NovaProvider(Provider):
                     continue
 
                 if inactive_host_ids or \
-                        cluster.state in [states.TASK_MIGRATING,
-                                          states.TASK_UPDATING]:
+                        cluster.state in [states.TASK_MIGRATING]:
                     # Host aggregate has changed but there are inactive hosts
                     # in the host aggregate or another thread is working on
                     # same cluster so do not reconfigure the cluster yet
