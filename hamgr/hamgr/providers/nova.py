@@ -14,12 +14,15 @@
 
 import hamgr.db.api as db_api
 import hamgr.exceptions as ha_exceptions
+import eventlet
 import logging
 import requests
+import threading
 import time
+
+from collections import defaultdict
 from datetime import datetime
 from datetime import timedelta
-
 from hamgr import states
 from hamgr import periodic_task
 from hamgr.common import utils
@@ -28,6 +31,7 @@ from novaclient import client, exceptions
 from provider import Provider
 
 LOG = logging.getLogger(__name__)
+eventlet.monkey_patch()
 
 
 class NovaProvider(Provider):
@@ -41,9 +45,17 @@ class NovaProvider(Provider):
         self._token = None
         periodic_task.add_task(self._check_host_aggregate_changes, 120,
                                run_now=True)
-        self.hosts_down_per_cluster = {}
+        self.hosts_down_per_cluster = defaultdict(dict)
+        self.aggregate_task_lock = threading.Lock()
+        self.aggregate_task_running = False
+        self.host_down_dict_lock = threading.Lock()
 
     def _check_host_aggregate_changes(self):
+        with self.aggregate_task_lock:
+            if self.aggregate_task_running:
+                LOG.info('Check host aggregates for changes task already running')
+                return
+            self.aggregate_task_running = True
         self._token = utils.get_token(self._tenant, self._username, self._passwd, self._token)
         clusters = db_api.get_all_active_clusters()
         client = self._get_client()
@@ -84,7 +96,7 @@ class NovaProvider(Provider):
                     continue
 
                 if inactive_host_ids or \
-                        cluster.state in [states.TASK_MIGRATING]:
+                        cluster.task_state in [states.TASK_MIGRATING]:
                     # Host aggregate has changed but there are inactive hosts
                     # in the host aggregate or another thread is working on
                     # same cluster so do not reconfigure the cluster yet
@@ -96,11 +108,18 @@ class NovaProvider(Provider):
             except ha_exceptions.ClusterBusy:
                 pass
             except ha_exceptions.InsufficientHosts:
-                LOG.warn('Disabling HA since number of aggregate %s hosts is insufficient', aggregate_id)
+                LOG.warn('Disabling HA since number of aggregate %s hosts is '
+                         'insufficient', aggregate_id)
             except ha_exceptions.SegmentNotFound:
-                LOG.warn('Failover segment for cluster: %s was not found', cluster.name)
+                LOG.warn('Failover segment for cluster: %s was not found',
+                         cluster.name)
             except Exception as e:
-                LOG.error('Exception while processing aggregate %s: %s', aggregate_id, e)
+                LOG.error('Exception while processing aggregate %s: %s',
+                          aggregate_id, e)
+
+            with self.aggregate_task_lock:
+                LOG.debug('Aggregate changes task completed')
+                self.aggregate_task_running = False
 
     def _is_nova_service_active(self, host_id, client=None):
         if not client:
@@ -109,7 +128,8 @@ class NovaProvider(Provider):
         services= client.services.list(binary=binary, host=host_id)
         if len(services) == 1:
             if services[0].state == 'up':
-                if services[0].status != 'enabled':
+                if services[0].status != 'enabled' \
+                        and services[0].disabled_reason == 'Host disabled by PF9 HA manager':
                     client.services.enable(binary=binary, host=host_id)
                 return True
             return False
@@ -226,7 +246,7 @@ class NovaProvider(Provider):
                    'server', ip=leader_ip)
         self._auth(ip_lookup, self._token, agents, 'agent', ip=leader_ip)
 
-    def _enable(self, aggregate_id, hosts=None):
+    def _enable(self, aggregate_id, hosts=None, update_task_state=True):
         client = self._get_client()
         str_aggregate_id = str(aggregate_id)
         cluster = None
@@ -237,12 +257,12 @@ class NovaProvider(Provider):
         except ha_exceptions.ClusterNotFound:
             pass
         else:
-            if cluster.task_state not in [states.TASK_COMPLETED,
-                                          states.TASK_MIGRATING]:
-                LOG.info('Cluster %s is running task %s, cannot enable',
-                        str_aggregate_id, cluster.task_state)
-                raise ha_exceptions.ClusterBusy(str_aggregate_id,
-                        cluster.task_state)
+            if cluster.task_state not in [states.TASK_COMPLETED]:
+                if update_task_state:
+                    LOG.info('Cluster %s is running task %s, cannot enable',
+                            str_aggregate_id, cluster.task_state)
+                    raise ha_exceptions.ClusterBusy(str_aggregate_id,
+                            cluster.task_state)
 
         aggregate = self._get_aggregate(client, aggregate_id)
         self._validate_hosts(aggregate.hosts)
@@ -272,7 +292,7 @@ class NovaProvider(Provider):
         except Exception as e:
             LOG.error('Cannot enable HA on %s: %s, performing cleanup by disabling', str_aggregate_id, e)
 
-            if cluster_id is not None:
+            if cluster_id is not None and update_task_state:
                 db_api.update_cluster_task_state(cluster_id, states.TASK_COMPLETED)
             self._disable(aggregate_id)
 
@@ -283,7 +303,7 @@ class NovaProvider(Provider):
                     pass
             raise
         else:
-            if cluster_id is not None:
+            if cluster_id is not None and update_task_state:
                 db_api.update_cluster_task_state(cluster_id, states.TASK_COMPLETED)
 
     def _wait_for_role_removal(self, nodes, rolename='pf9-ha-slave'):
@@ -327,7 +347,7 @@ class NovaProvider(Provider):
                     break
             resp.raise_for_status()
 
-    def _disable(self, aggregate_id, synchronize=False):
+    def _disable(self, aggregate_id, synchronize=False, update_task_state=True):
         str_aggregate_id = str(aggregate_id)
         cluster = None
         try:
@@ -335,10 +355,9 @@ class NovaProvider(Provider):
         except ha_exceptions.ClusterNotFound:
             pass
 
-        if cluster:
-            if not cluster.task_state in [states.TASK_COMPLETED,
-                                          states.TASK_ERROR_REMOVING,
-                                          states.TASK_MIGRATING]:
+        if cluster and update_task_state:
+            if cluster.task_state not in [states.TASK_COMPLETED,
+                                          states.TASK_ERROR_REMOVING]:
                 LOG.info('Cluster %s is busy in %s state', cluster.name,
                         cluster.task_state)
                 raise ha_exceptions.ClusterBusy(cluster.name, cluster.task_state)
@@ -369,13 +388,15 @@ class NovaProvider(Provider):
 
             masakari.delete_failover_segment(self._token, str_aggregate_id)
         except:
-            if cluster:
+            if cluster and update_task_state:
                 db_api.update_cluster_task_state(cluster.id, states.TASK_ERROR_REMOVING)
             raise
         else:
             if cluster:
                 db_api.update_cluster(cluster.id, False)
-                db_api.update_cluster_task_state(cluster.id, states.TASK_COMPLETED)
+                if update_task_state:
+                    db_api.update_cluster_task_state(cluster.id,
+                                                     states.TASK_COMPLETED)
 
     def put(self, aggregate_id, method):
         if method == 'enable':
@@ -400,8 +421,7 @@ class NovaProvider(Provider):
         aggregate_id = cluster.name
         aggregate = self._get_aggregate(client, aggregate_id)
         current_host_ids = set(aggregate.hosts)
-        if cluster.id not in self.hosts_down_per_cluster:
-            self.hosts_down_per_cluster[cluster.id] = {}
+
         try:
             nodes = masakari.get_nodes_in_segment(self._token, aggregate_id)
             db_node_ids = set([node['name'] for node in nodes])
@@ -418,8 +438,9 @@ class NovaProvider(Provider):
             if all([v for k, v in self.hosts_down_per_cluster[cluster.id].items()]):
                 host_list = current_host_ids - \
                         set(self.hosts_down_per_cluster[cluster.id].keys())
-                self._disable(aggregate_id, synchronize=True)
-                self._enable(aggregate_id, hosts=list(host_list))
+                # Task state will be managed by this function
+                self._disable(aggregate_id, synchronize=True, update_task_state=False)
+                self._enable(aggregate_id, hosts=list(host_list), update_task_state=False)
                 self.hosts_down_per_cluster.pop(cluster.id)
             else:
                 # TODO: Addtional tests to verify that multiple host failures
