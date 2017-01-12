@@ -117,9 +117,9 @@ class NovaProvider(Provider):
                 LOG.error('Exception while processing aggregate %s: %s',
                           aggregate_id, e)
 
-            with self.aggregate_task_lock:
-                LOG.debug('Aggregate changes task completed')
-                self.aggregate_task_running = False
+        with self.aggregate_task_lock:
+            LOG.debug('Aggregate changes task completed')
+            self.aggregate_task_running = False
 
     def _is_nova_service_active(self, host_id, client=None):
         if not client:
@@ -491,9 +491,14 @@ class NovaProvider(Provider):
             "cluster_status": cluster_status
         }
         try:
-            self._token = utils.get_token(self._tenant, self._username, self._passwd, self._token)
-            masakari.create_notification(self._token, notification_type,
-                                         host, time, payload)
+            if self._is_nova_service_active(host):
+                # When the cluster was reconfigured for host down event this
+                # node is removed from masakari. Hence generating a host up
+                # notification will result in 404. The node will be added back
+                # in the cluster with the next periodic task run.
+                return True
+            # No point in adding the node back if nova-compute is down
+            return False
         except:
             return False
         return True
